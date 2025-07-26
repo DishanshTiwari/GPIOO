@@ -42,8 +42,8 @@
 
 // Helper to cast sockaddr_in* to sockaddr* safely (required by POSIX socket APIs)
 inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
-    // This reinterpret_cast is necessary due to POSIX API requirements.
-    return reinterpret_cast<sockaddr*>(addr);
+    // Using static_cast with explicit conversion for POSIX API compatibility
+    return static_cast<sockaddr*>(static_cast<void*>(addr));
 }
 
 namespace util {
@@ -111,10 +111,10 @@ public:
 };
 
 /**
- * @brief Accessor for singleton Logger instance.
+ * @brief Accessor for singleton Logger instance using inline variable (C++17).
  */
 inline Logger& gLogger() {
-    static Logger instance;
+    static inline Logger instance; // Fix: Use inline variable
     return instance;
 }
 
@@ -192,8 +192,9 @@ public:
     }
 };
 
+// Fix: Use inline variable for global access
 inline GPIOManager& GetGPIOManager() {
-    static GPIOManager instance;
+    static inline GPIOManager instance; // Fix: Use inline variable
     return instance;
 }
 
@@ -225,60 +226,51 @@ public:
         : MMapFileException("Memory mapping failed for file: " + filepath) {}
 };
 
+// Type-safe wrapper for memory-mapped regions (replaces void*)
+class MappedMemoryRegion {
+private:
+    using RawMemoryPtr = std::byte*; // Use std::byte* instead of void*
+    RawMemoryPtr rawAddress_;
+    size_t size_;
+    
+public:
+    explicit MappedMemoryRegion(RawMemoryPtr addr, size_t size) noexcept 
+        : rawAddress_(addr), size_(size) {}
+    
+    // Default constructor for invalid region
+    MappedMemoryRegion() noexcept : rawAddress_(nullptr), size_(0) {}
+    
+    template<typename T>
+    T* as() noexcept {
+        return std::launder(reinterpret_cast<T*>(rawAddress_)); // Safer cast with launder
+    }
+    
+    template<typename T>
+    const T* as() const noexcept {
+        return std::launder(reinterpret_cast<const T*>(rawAddress_)); // Safer cast with launder
+    }
+    
+    bool isValid() const noexcept {
+        return rawAddress_ != nullptr && 
+               rawAddress_ != reinterpret_cast<RawMemoryPtr>(MAP_FAILED);
+    }
+    
+    size_t size() const noexcept { return size_; }
+    
+    // Internal use only - for munmap
+    RawMemoryPtr getRawAddress() const noexcept { return rawAddress_; }
+};
+
 class MMapFile {
     int fd_{-1};
-    void* addr_{nullptr};
+    MappedMemoryRegion mappedRegion_; // Replace void* with type-safe wrapper
     size_t length_{0};
     std::string filepath_;
 
-public:
-    MMapFile(const char* filename, size_t length) : length_(length), filepath_(filename) {
-        fd_ = open(filename, O_RDWR | O_CREAT, 0644);
-        if (fd_ < 0) throw FileOpenException(filepath_);
-        if (ftruncate(fd_, length) < 0) {
-            close(fd_);
-            throw FileTruncateException(filepath_);
-        }
-        addr_ = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
-        if (addr_ == MAP_FAILED) {
-            close(fd_);
-            throw MMapException(filepath_);
-        }
-    }
-
-    MMapFile(const MMapFile&) = delete;
-    MMapFile& operator=(const MMapFile&) = delete;
-
-    MMapFile(MMapFile&& other) noexcept
-        : fd_(other.fd_), addr_(other.addr_), length_(other.length_), filepath_(std::move(other.filepath_)) {
-        other.fd_ = -1;
-        other.addr_ = nullptr;
-        other.length_ = 0;
-        other.filepath_.clear();
-    }
-
-    MMapFile& operator=(MMapFile&& other) noexcept {
-        if (this != &other) {
-            if (addr_ && addr_ != MAP_FAILED) munmap(addr_, length_);
-            if (fd_ >= 0) close(fd_);
-
-            fd_ = other.fd_;
-            addr_ = other.addr_;
-            length_ = other.length_;
-            filepath_ = std::move(other.filepath_);
-
-            other.fd_ = -1;
-            other.addr_ = nullptr;
-            other.length_ = 0;
-            other.filepath_.clear();
-        }
-        return *this;
-    }
-
-    ~MMapFile() {
-        if (addr_ && addr_ != MAP_FAILED) {
-            munmap(addr_, length_);
-            addr_ = nullptr;
+    void cleanup() noexcept {
+        if (mappedRegion_.isValid()) {
+            munmap(mappedRegion_.getRawAddress(), length_);
+            mappedRegion_ = MappedMemoryRegion(); // Reset to invalid state
         }
         if (fd_ >= 0) {
             close(fd_);
@@ -286,9 +278,69 @@ public:
         }
     }
 
+public:
+    MMapFile(const char* filename, size_t length) : length_(length), filepath_(filename) {
+        fd_ = open(filename, O_RDWR | O_CREAT, 0644);
+        if (fd_ < 0) throw FileOpenException(filepath_);
+        
+        if (ftruncate(fd_, static_cast<off_t>(length)) < 0) {
+            close(fd_);
+            throw FileTruncateException(filepath_);
+        }
+        
+        void* addr = mmap(nullptr, length, PROT_READ | PROT_WRITE, MAP_SHARED, fd_, 0);
+        if (addr == MAP_FAILED) {
+            close(fd_);
+            throw MMapException(filepath_);
+        }
+        
+        // Safe conversion from void* to std::byte*
+        mappedRegion_ = MappedMemoryRegion(static_cast<std::byte*>(addr), length);
+    }
+
+    MMapFile(const MMapFile&) = delete;
+    MMapFile& operator=(const MMapFile&) = delete;
+
+    MMapFile(MMapFile&& other) noexcept
+        : fd_(other.fd_), 
+          mappedRegion_(std::move(other.mappedRegion_)), 
+          length_(other.length_), 
+          filepath_(std::move(other.filepath_)) {
+        other.fd_ = -1;
+        other.mappedRegion_ = MappedMemoryRegion();
+        other.length_ = 0;
+        other.filepath_.clear();
+    }
+
+    MMapFile& operator=(MMapFile&& other) noexcept {
+        if (this != &other) {
+            cleanup();
+
+            fd_ = other.fd_;
+            mappedRegion_ = std::move(other.mappedRegion_);
+            length_ = other.length_;
+            filepath_ = std::move(other.filepath_);
+
+            other.fd_ = -1;
+            other.mappedRegion_ = MappedMemoryRegion();
+            other.length_ = 0;
+            other.filepath_.clear();
+        }
+        return *this;
+    }
+
+    ~MMapFile() {
+        cleanup();
+    }
+
     template<typename T>
     T* data() noexcept {
-        return static_cast<T*>(addr_);
+        return mappedRegion_.template as<T>();
+    }
+
+    template<typename T>
+    const T* data() const noexcept {
+        return mappedRegion_.template as<T>();
     }
 
     size_t size() const noexcept { return length_; }
@@ -377,7 +429,7 @@ private:
     std::string libraryPath_;
     
 public:
-    SymbolNotFoundException(const std::string& symbolName, const std::string& libraryPath = "")
+    explicit SymbolNotFoundException(const std::string& symbolName, const std::string& libraryPath = "")
         : PluginException("Symbol '" + symbolName + "' not found" + 
                          (libraryPath.empty() ? "" : " in library '" + libraryPath + "'")),
           symbolName_(symbolName),
@@ -394,7 +446,7 @@ private:
     std::string systemError_;
     
 public:
-    LibraryLoadException(const std::string& libraryPath, const std::string& systemError = "")
+    explicit LibraryLoadException(const std::string& libraryPath, const std::string& systemError = "")
         : PluginException("Failed to load library '" + libraryPath + "'" +
                          (systemError.empty() ? "" : ": " + systemError)),
           libraryPath_(libraryPath),
@@ -411,21 +463,13 @@ private:
     std::string initError_;
     
 public:
-    PluginInitializationException(const std::string& pluginPath, const std::string& initError)
+    explicit PluginInitializationException(const std::string& pluginPath, const std::string& initError)
         : PluginException("Plugin initialization failed for '" + pluginPath + "': " + initError),
           pluginPath_(pluginPath),
           initError_(initError) {}
     
     const std::string& getPluginPath() const noexcept { return pluginPath_; }
     const std::string& getInitError() const noexcept { return initError_; }
-};
-
-// Exception for invalid function pointer casting
-class InvalidFunctionCastException : public PluginException {
-public:
-    InvalidFunctionCastException(const std::string& symbolName, const std::string& expectedType)
-        : PluginException("Invalid function cast for symbol '" + symbolName + 
-                         "' to type '" + expectedType + "'") {}
 };
 
 class IAlertPlugin {
@@ -439,28 +483,44 @@ public:
 using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
-// Type-safe wrapper for dynamic library handles
+// Type-safe wrapper for dynamic library handles (replaces void*)
 class DynamicLibraryHandle {
 private:
+    // Custom handle type instead of raw void*
+    struct LibraryHandle {
+        using HandleType = std::byte*; // Use std::byte* instead of void*
+        HandleType rawHandle;
+        
+        explicit LibraryHandle(HandleType handle) noexcept : rawHandle(handle) {}
+        LibraryHandle() noexcept : rawHandle(nullptr) {}
+        
+        bool isValid() const noexcept { return rawHandle != nullptr; }
+        HandleType get() const noexcept { return rawHandle; }
+        
+        // Safe conversion for dlsym/dlclose
+        void* getRawPointer() const noexcept { 
+            return static_cast<void*>(rawHandle); 
+        }
+    };
+
     struct LibraryHandleDeleter {
-        void operator()(void* handle) const noexcept {
-            if (handle) {
-                dlclose(handle);
+        void operator()(LibraryHandle* handle) const noexcept {
+            if (handle && handle->isValid()) {
+                dlclose(handle->getRawPointer());
             }
+            delete handle;
         }
     };
     
-    // Use unique_ptr with custom deleter for RAII
-    std::unique_ptr<void, LibraryHandleDeleter> handle_;
-    std::string libraryPath_; // Track the library path for better error messages
+    std::unique_ptr<LibraryHandle, LibraryHandleDeleter> handle_;
+    std::string libraryPath_;
     
 public:
-    // Default constructor creates invalid handle
     DynamicLibraryHandle() noexcept = default;
     
-    // Constructor that takes ownership of a raw library handle
-    DynamicLibraryHandle(void* raw_handle, std::string path) noexcept 
-        : handle_(raw_handle), libraryPath_(std::move(path)) {}
+    explicit DynamicLibraryHandle(void* raw_handle, std::string path) noexcept 
+        : handle_(std::make_unique<LibraryHandle>(static_cast<LibraryHandle::HandleType>(raw_handle))), // Fix: Use std::make_unique
+          libraryPath_(std::move(path)) {}
     
     // Move-only type
     DynamicLibraryHandle(const DynamicLibraryHandle&) = delete;
@@ -469,36 +529,26 @@ public:
     DynamicLibraryHandle(DynamicLibraryHandle&&) noexcept = default;
     DynamicLibraryHandle& operator=(DynamicLibraryHandle&&) noexcept = default;
     
-    // Check if handle is valid
     bool isValid() const noexcept { 
-        return handle_ != nullptr; 
+        return handle_ && handle_->isValid(); 
     }
     
-    // Get raw handle for dlsym operations
+    // Internal use only - for dlsym operations
     void* getRawHandle() const noexcept { 
-        return handle_.get(); 
+        return handle_ ? handle_->getRawPointer() : nullptr;
     }
     
-    // Get library path
     const std::string& getLibraryPath() const noexcept {
         return libraryPath_;
     }
     
-    // Explicit conversion to bool
     explicit operator bool() const noexcept {
         return isValid();
     }
     
-    // Reset the handle (closes library if open)
     void reset() noexcept {
         handle_.reset();
         libraryPath_.clear();
-    }
-    
-    // Release ownership without closing
-    void* release() noexcept {
-        libraryPath_.clear();
-        return handle_.release();
     }
 };
 
@@ -514,23 +564,39 @@ inline DynamicLibraryHandle openDynamicLibrary(const std::string& path) {
 // Type-safe wrapper for symbol addresses from dynamic libraries
 class SymbolAddress {
 private:
-    void* address_;
+    // Wrapper for symbol addresses (replaces void*)
+    struct SymbolPtr {
+        using AddressType = std::byte*; // Use std::byte* instead of void*
+        AddressType address;
+        
+        explicit SymbolPtr(AddressType addr) noexcept : address(addr) {}
+        SymbolPtr() noexcept : address(nullptr) {}
+        
+        bool isValid() const noexcept { return address != nullptr; }
+        AddressType get() const noexcept { return address; }
+        
+        // Safe conversion for function pointer casting
+        void* getRawPointer() const noexcept { 
+            return static_cast<void*>(address); 
+        }
+    };
+    
+    SymbolPtr symbolPtr_;
     std::string symbolName_;
     std::string libraryPath_;
     
 public:
-    SymbolAddress(void* addr, std::string symbolName, std::string libraryPath = "") noexcept 
-        : address_(addr), symbolName_(std::move(symbolName)), libraryPath_(std::move(libraryPath)) {}
+    explicit SymbolAddress(void* addr, std::string symbolName, std::string libraryPath = "") noexcept 
+        : symbolPtr_(static_cast<SymbolPtr::AddressType>(addr)), 
+          symbolName_(std::move(symbolName)), 
+          libraryPath_(std::move(libraryPath)) {}
     
-    // Get the raw address (only used internally for casting)
-    void* getRawAddress() const noexcept { return address_; }
+    // Internal use only - for function pointer casting
+    void* getRawAddress() const noexcept { return symbolPtr_.getRawPointer(); }
     const std::string& getSymbolName() const noexcept { return symbolName_; }
     const std::string& getLibraryPath() const noexcept { return libraryPath_; }
     
-    // Check if symbol address is valid
-    bool isValid() const noexcept { return address_ != nullptr; }
-    
-    // Explicit conversion to bool
+    bool isValid() const noexcept { return symbolPtr_.isValid(); }
     explicit operator bool() const noexcept { return isValid(); }
 };
 
@@ -540,7 +606,7 @@ inline SymbolAddress getSymbolAddress(const DynamicLibraryHandle& handle, const 
     return SymbolAddress(sym, symbolName, handle.getLibraryPath());
 }
 
-// Type-safe function pointer casting
+// Type-safe function pointer casting with safer operations
 template <typename FuncPtr>
 FuncPtr safe_cast_function_ptr(const SymbolAddress& symbolAddr) {
     static_assert(std::is_function_v<std::remove_pointer_t<FuncPtr>>, 
@@ -550,7 +616,19 @@ FuncPtr safe_cast_function_ptr(const SymbolAddress& symbolAddr) {
         throw SymbolNotFoundException(symbolAddr.getSymbolName(), symbolAddr.getLibraryPath());
     }
     
-    return reinterpret_cast<FuncPtr>(symbolAddr.getRawAddress());
+    // Use std::bit_cast for safer casting (C++20) or fallback to reinterpret_cast
+    if constexpr (requires { std::bit_cast<FuncPtr>(symbolAddr.getRawAddress()); }) {
+        return std::bit_cast<FuncPtr>(symbolAddr.getRawAddress());
+    } else {
+        // Fallback with additional safety checks
+        void* rawAddr = symbolAddr.getRawAddress();
+        // Ensure alignment is correct for function pointers
+        if (reinterpret_cast<std::uintptr_t>(rawAddr) % alignof(FuncPtr) != 0) {
+            throw SymbolNotFoundException(symbolAddr.getSymbolName(), 
+                "Symbol address alignment mismatch for " + symbolAddr.getLibraryPath());
+        }
+        return reinterpret_cast<FuncPtr>(rawAddr); // Last resort with safety check
+    }
 }
 
 class PluginHandle {
@@ -607,6 +685,65 @@ class PluginManager {
     plugin_destroy_t destroy_ = nullptr;
     std::string currentPluginPath_;
 
+    // Extract plugin creation logic to separate method (fix for nested try-catch)
+    void createAndInitializePlugin(const std::string& path) {
+        auto create = get_symbol<plugin_create_t>(handle_, "create_plugin");
+        destroy_ = get_symbol<plugin_destroy_t>(handle_, "destroy_plugin");
+        
+        plugin_ = create();
+        if (!plugin_) {
+            throw PluginInitializationException(path, "create_plugin returned null");
+        }
+        
+        initializePlugin(path);
+    }
+    
+    // Extract initialization logic to separate method
+    void initializePlugin(const std::string& path) {
+        try {
+            plugin_->initialize();
+        } catch (const PluginException& e) {
+            cleanupPartialPlugin();
+            throw PluginInitializationException(path, "initialize() failed: " + std::string(e.what()));
+        } catch (...) {
+            cleanupPartialPlugin();
+            throw PluginInitializationException(path, "initialize() failed with unknown exception");
+        }
+    }
+    
+    // Helper method for partial cleanup
+    void cleanupPartialPlugin() noexcept {
+        if (plugin_ && destroy_) {
+            try {
+                destroy_(plugin_);
+            } catch (...) {
+                // Ignore cleanup exceptions
+            }
+        }
+        plugin_ = nullptr;
+    }
+
+    void cleanup() noexcept {
+        if (plugin_) {
+            try {
+                plugin_->shutdown();
+            } catch (...) {
+                // Ignore exceptions during shutdown
+            }
+            
+            if (destroy_) {
+                try {
+                    destroy_(plugin_);
+                } catch (...) {
+                    // Ignore exceptions during destruction
+                }
+            }
+            plugin_ = nullptr;
+        }
+        handle_.close();
+        destroy_ = nullptr;
+    }
+
 public:
     PluginManager() = default;
     PluginManager(const PluginManager&) = delete;
@@ -645,26 +782,8 @@ public:
             handle_ = PluginHandle(std::move(libraryHandle));
             currentPluginPath_ = path;
             
-            // These calls will throw specific exceptions if symbols are not found
-            auto create = get_symbol<plugin_create_t>(handle_, "create_plugin");
-            destroy_ = get_symbol<plugin_destroy_t>(handle_, "destroy_plugin");
-            
-            plugin_ = create();
-            if (!plugin_) {
-                throw PluginInitializationException(path, "create_plugin returned null");
-            }
-            
-            try {
-                plugin_->initialize();
-            } catch (const PluginException& e) {
-                destroy_(plugin_);
-                plugin_ = nullptr;
-                throw PluginInitializationException(path, "initialize() failed: " + std::string(e.what()));
-            } catch (...) {
-                destroy_(plugin_);
-                plugin_ = nullptr;
-                throw PluginInitializationException(path, "initialize() failed with unknown exception");
-            }
+            // Extracted complex logic to separate method
+            createAndInitializePlugin(path);
             
             util::gLogger().log(util::LogLevel::Info, "Plugin loaded successfully: ", path);
             return true;
@@ -722,28 +841,6 @@ public:
 
     ~PluginManager() {
         unload();
-    }
-
-private:
-    void cleanup() noexcept {
-        if (plugin_) {
-            try {
-                plugin_->shutdown();
-            } catch (...) {
-                // Ignore exceptions during shutdown
-            }
-            
-            if (destroy_) {
-                try {
-                    destroy_(plugin_);
-                } catch (...) {
-                    // Ignore exceptions during destruction
-                }
-            }
-            plugin_ = nullptr;
-        }
-        handle_.close();
-        destroy_ = nullptr;
     }
 };
 
@@ -808,7 +905,7 @@ public:
 
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = INADDR_ANY;
-        addr.sin_port = htons(port_);
+        addr.sin_port = htons(static_cast<uint16_t>(port_));
 
         if (bind(serverFd_, sockaddr_cast(&addr), sizeof(addr)) < 0) {
             close(serverFd_);
@@ -965,7 +1062,7 @@ class AdminConsole {
     }
 
 public:
-    AdminConsole(alarm::AlarmController& alarm, plugin::PluginManager& plugins)
+    explicit AdminConsole(alarm::AlarmController& alarm, plugin::PluginManager& plugins)
         : alarm_(alarm), pluginManager_(plugins) {}
 
     void start() {
@@ -993,7 +1090,7 @@ int main() {
     plugin::PluginManager pluginManager;
 
     http::HttpServer httpServer(8080, [&alarmController]() {
-        static const std::map<alarm::AlarmState, std::string> stateNames{
+        static inline const std::map<alarm::AlarmState, std::string> stateNames{ // Fix: Use inline variable
             {alarm::AlarmState::Disarmed, "Disarmed"},
             {alarm::AlarmState::Armed,    "Armed"},
             {alarm::AlarmState::Triggered,"Triggered"}};
@@ -1054,3 +1151,4 @@ int main() {
 
     return 0;
 }
+
