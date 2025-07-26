@@ -38,6 +38,7 @@
 #include <unistd.h>
 #include <ctime>
 #include <type_traits>
+#include <memory>
 
 // Helper to cast sockaddr_in* to sockaddr* safely (required by POSIX socket APIs)
 inline sockaddr* sockaddr_cast(sockaddr_in* addr) noexcept {
@@ -192,7 +193,7 @@ public:
 };
 
 inline GPIOManager& GetGPIOManager() {
-    inline GPIOManager instance;
+    static GPIOManager instance;
     return instance;
 }
 
@@ -202,7 +203,8 @@ namespace persistence {
 
 class MMapFileException : public std::runtime_error {
 public:
-    explicit MMapFileException(const std::string& message) : std::runtime_error(message) {}
+    // Use inherited constructors instead of manually duplicating them
+    using std::runtime_error::runtime_error;
 };
 
 class FileOpenException : public MMapFileException {
@@ -361,6 +363,71 @@ public:
 
 namespace plugin {
 
+// Base exception class for all plugin-related errors
+class PluginException : public std::runtime_error {
+public:
+    // Use inherited constructors from std::runtime_error
+    using std::runtime_error::runtime_error;
+};
+
+// Specific exception for symbol resolution failures
+class SymbolNotFoundException : public PluginException {
+private:
+    std::string symbolName_;
+    std::string libraryPath_;
+    
+public:
+    SymbolNotFoundException(const std::string& symbolName, const std::string& libraryPath = "")
+        : PluginException("Symbol '" + symbolName + "' not found" + 
+                         (libraryPath.empty() ? "" : " in library '" + libraryPath + "'")),
+          symbolName_(symbolName),
+          libraryPath_(libraryPath) {}
+    
+    const std::string& getSymbolName() const noexcept { return symbolName_; }
+    const std::string& getLibraryPath() const noexcept { return libraryPath_; }
+};
+
+// Exception for library loading failures
+class LibraryLoadException : public PluginException {
+private:
+    std::string libraryPath_;
+    std::string systemError_;
+    
+public:
+    LibraryLoadException(const std::string& libraryPath, const std::string& systemError = "")
+        : PluginException("Failed to load library '" + libraryPath + "'" +
+                         (systemError.empty() ? "" : ": " + systemError)),
+          libraryPath_(libraryPath),
+          systemError_(systemError) {}
+    
+    const std::string& getLibraryPath() const noexcept { return libraryPath_; }
+    const std::string& getSystemError() const noexcept { return systemError_; }
+};
+
+// Exception for plugin initialization failures
+class PluginInitializationException : public PluginException {
+private:
+    std::string pluginPath_;
+    std::string initError_;
+    
+public:
+    PluginInitializationException(const std::string& pluginPath, const std::string& initError)
+        : PluginException("Plugin initialization failed for '" + pluginPath + "': " + initError),
+          pluginPath_(pluginPath),
+          initError_(initError) {}
+    
+    const std::string& getPluginPath() const noexcept { return pluginPath_; }
+    const std::string& getInitError() const noexcept { return initError_; }
+};
+
+// Exception for invalid function pointer casting
+class InvalidFunctionCastException : public PluginException {
+public:
+    InvalidFunctionCastException(const std::string& symbolName, const std::string& expectedType)
+        : PluginException("Invalid function cast for symbol '" + symbolName + 
+                         "' to type '" + expectedType + "'") {}
+};
+
 class IAlertPlugin {
 public:
     virtual ~IAlertPlugin() = default;
@@ -372,59 +439,173 @@ public:
 using plugin_create_t = IAlertPlugin* (*)();
 using plugin_destroy_t = void (*)(IAlertPlugin*);
 
-class PluginHandle {
+// Type-safe wrapper for dynamic library handles
+class DynamicLibraryHandle {
 private:
-    using SharedLibHandle = void*;
-    SharedLibHandle handle_{nullptr};
-
+    struct LibraryHandleDeleter {
+        void operator()(void* handle) const noexcept {
+            if (handle) {
+                dlclose(handle);
+            }
+        }
+    };
+    
+    // Use unique_ptr with custom deleter for RAII
+    std::unique_ptr<void, LibraryHandleDeleter> handle_;
+    std::string libraryPath_; // Track the library path for better error messages
+    
 public:
-    explicit PluginHandle(SharedLibHandle handle = nullptr) noexcept : handle_(handle) {}
-    bool isValid() const noexcept { return handle_ != nullptr; }
-    SharedLibHandle get() const noexcept { return handle_; }
-
-    void close() noexcept {
-        if (handle_) {
-            dlclose(handle_);
-            handle_ = nullptr;
-        }
+    // Default constructor creates invalid handle
+    DynamicLibraryHandle() noexcept = default;
+    
+    // Constructor that takes ownership of a raw library handle
+    DynamicLibraryHandle(void* raw_handle, std::string path) noexcept 
+        : handle_(raw_handle), libraryPath_(std::move(path)) {}
+    
+    // Move-only type
+    DynamicLibraryHandle(const DynamicLibraryHandle&) = delete;
+    DynamicLibraryHandle& operator=(const DynamicLibraryHandle&) = delete;
+    
+    DynamicLibraryHandle(DynamicLibraryHandle&&) noexcept = default;
+    DynamicLibraryHandle& operator=(DynamicLibraryHandle&&) noexcept = default;
+    
+    // Check if handle is valid
+    bool isValid() const noexcept { 
+        return handle_ != nullptr; 
     }
-
-    PluginHandle(const PluginHandle&) = delete;
-    PluginHandle& operator=(const PluginHandle&) = delete;
-
-    PluginHandle(PluginHandle&& other) noexcept : handle_(other.handle_) {
-        other.handle_ = nullptr;
+    
+    // Get raw handle for dlsym operations
+    void* getRawHandle() const noexcept { 
+        return handle_.get(); 
     }
-
-    PluginHandle& operator=(PluginHandle&& other) noexcept {
-        if (this != &other) {
-            close();
-            handle_ = other.handle_;
-            other.handle_ = nullptr;
-        }
-        return *this;
+    
+    // Get library path
+    const std::string& getLibraryPath() const noexcept {
+        return libraryPath_;
     }
-    ~PluginHandle() {
-        close();
+    
+    // Explicit conversion to bool
+    explicit operator bool() const noexcept {
+        return isValid();
+    }
+    
+    // Reset the handle (closes library if open)
+    void reset() noexcept {
+        handle_.reset();
+        libraryPath_.clear();
+    }
+    
+    // Release ownership without closing
+    void* release() noexcept {
+        libraryPath_.clear();
+        return handle_.release();
     }
 };
 
-template <typename FuncPtr>
-FuncPtr safe_cast_function_ptr(void* p) noexcept {
-    return reinterpret_cast<FuncPtr>(p);
+// Factory function to create library handle
+inline DynamicLibraryHandle openDynamicLibrary(const std::string& path) {
+    void* raw_handle = dlopen(path.c_str(), RTLD_NOW);
+    if (!raw_handle) {
+        throw LibraryLoadException(path, dlerror());
+    }
+    return DynamicLibraryHandle(raw_handle, path);
 }
 
+// Type-safe wrapper for symbol addresses from dynamic libraries
+class SymbolAddress {
+private:
+    void* address_;
+    std::string symbolName_;
+    std::string libraryPath_;
+    
+public:
+    SymbolAddress(void* addr, std::string symbolName, std::string libraryPath = "") noexcept 
+        : address_(addr), symbolName_(std::move(symbolName)), libraryPath_(std::move(libraryPath)) {}
+    
+    // Get the raw address (only used internally for casting)
+    void* getRawAddress() const noexcept { return address_; }
+    const std::string& getSymbolName() const noexcept { return symbolName_; }
+    const std::string& getLibraryPath() const noexcept { return libraryPath_; }
+    
+    // Check if symbol address is valid
+    bool isValid() const noexcept { return address_ != nullptr; }
+    
+    // Explicit conversion to bool
+    explicit operator bool() const noexcept { return isValid(); }
+};
+
+// Factory function to get symbol from library
+inline SymbolAddress getSymbolAddress(const DynamicLibraryHandle& handle, const char* symbolName) {
+    void* sym = dlsym(handle.getRawHandle(), symbolName);
+    return SymbolAddress(sym, symbolName, handle.getLibraryPath());
+}
+
+// Type-safe function pointer casting
+template <typename FuncPtr>
+FuncPtr safe_cast_function_ptr(const SymbolAddress& symbolAddr) {
+    static_assert(std::is_function_v<std::remove_pointer_t<FuncPtr>>, 
+                  "FuncPtr must be a function pointer type");
+    
+    if (!symbolAddr.isValid()) {
+        throw SymbolNotFoundException(symbolAddr.getSymbolName(), symbolAddr.getLibraryPath());
+    }
+    
+    return reinterpret_cast<FuncPtr>(symbolAddr.getRawAddress());
+}
+
+class PluginHandle {
+private:
+    DynamicLibraryHandle libraryHandle_;
+
+public:
+    PluginHandle() noexcept = default;
+    explicit PluginHandle(DynamicLibraryHandle handle) noexcept 
+        : libraryHandle_(std::move(handle)) {}
+
+    bool isValid() const noexcept { 
+        return libraryHandle_.isValid(); 
+    }
+    
+    void* getRawHandle() const noexcept { 
+        return libraryHandle_.getRawHandle(); 
+    }
+
+    const DynamicLibraryHandle& getLibraryHandle() const noexcept {
+        return libraryHandle_;
+    }
+
+    void close() noexcept {
+        libraryHandle_.reset();
+    }
+
+    // Move-only semantics
+    PluginHandle(const PluginHandle&) = delete;
+    PluginHandle& operator=(const PluginHandle&) = delete;
+
+    PluginHandle(PluginHandle&&) noexcept = default;
+    PluginHandle& operator=(PluginHandle&&) noexcept = default;
+
+    ~PluginHandle() = default; // RAII handled by DynamicLibraryHandle
+};
+
+// Updated get_symbol function with specific exception
 template <typename FuncPtr>
 FuncPtr get_symbol(const PluginHandle& ph, const char* symbolName) {
-    void* sym = dlsym(ph.get(), symbolName);
-    if (!sym) throw std::runtime_error("Symbol not found: " + std::string(symbolName));
-    return safe_cast_function_ptr<FuncPtr>(sym);
+    if (!ph.isValid()) {
+        throw PluginException("Invalid plugin handle provided to get_symbol");
+    }
+    
+    auto symbolAddr = getSymbolAddress(ph.getLibraryHandle(), symbolName);
+    
+    // This will throw SymbolNotFoundException if symbol is not found
+    return safe_cast_function_ptr<FuncPtr>(symbolAddr);
 }
 
 class PluginManager {
     PluginHandle handle_;
     IAlertPlugin* plugin_ = nullptr;
     plugin_destroy_t destroy_ = nullptr;
+    std::string currentPluginPath_;
 
 public:
     PluginManager() = default;
@@ -432,7 +613,10 @@ public:
     PluginManager& operator=(const PluginManager&) = delete;
 
     PluginManager(PluginManager&& other) noexcept
-        : handle_(std::move(other.handle_)), plugin_(other.plugin_), destroy_(other.destroy_) {
+        : handle_(std::move(other.handle_)), 
+          plugin_(other.plugin_), 
+          destroy_(other.destroy_),
+          currentPluginPath_(std::move(other.currentPluginPath_)) {
         other.plugin_ = nullptr;
         other.destroy_ = nullptr;
     }
@@ -443,6 +627,7 @@ public:
             handle_ = std::move(other.handle_);
             plugin_ = other.plugin_;
             destroy_ = other.destroy_;
+            currentPluginPath_ = std::move(other.currentPluginPath_);
             other.plugin_ = nullptr;
             other.destroy_ = nullptr;
         }
@@ -450,51 +635,115 @@ public:
     }
 
     bool load(const std::string& path) {
-        if (handle_.isValid()) return false;
-        void* libHandle = dlopen(path.c_str(), RTLD_NOW);
-        if (!libHandle) {
-            util::gLogger().log(util::LogLevel::Error, "Failed to load plugin: ", dlerror());
-            return false;
+        if (handle_.isValid()) {
+            util::gLogger().log(util::LogLevel::Warn, "Plugin already loaded, unloading first");
+            unload();
         }
-        handle_ = PluginHandle(libHandle);
+        
         try {
+            auto libraryHandle = openDynamicLibrary(path);
+            handle_ = PluginHandle(std::move(libraryHandle));
+            currentPluginPath_ = path;
+            
+            // These calls will throw specific exceptions if symbols are not found
             auto create = get_symbol<plugin_create_t>(handle_, "create_plugin");
             destroy_ = get_symbol<plugin_destroy_t>(handle_, "destroy_plugin");
+            
             plugin_ = create();
-            plugin_->initialize();
-            util::gLogger().log(util::LogLevel::Info, "Plugin loaded: ", path);
-        } catch (const std::exception& e) {
-            handle_.close();
-            plugin_ = nullptr;
-            destroy_ = nullptr;
-            util::gLogger().log(util::LogLevel::Error, "Plugin load error: ", e.what());
+            if (!plugin_) {
+                throw PluginInitializationException(path, "create_plugin returned null");
+            }
+            
+            try {
+                plugin_->initialize();
+            } catch (const PluginException& e) {
+                destroy_(plugin_);
+                plugin_ = nullptr;
+                throw PluginInitializationException(path, "initialize() failed: " + std::string(e.what()));
+            } catch (...) {
+                destroy_(plugin_);
+                plugin_ = nullptr;
+                throw PluginInitializationException(path, "initialize() failed with unknown exception");
+            }
+            
+            util::gLogger().log(util::LogLevel::Info, "Plugin loaded successfully: ", path);
+            return true;
+            
+        } catch (const SymbolNotFoundException& e) {
+            util::gLogger().log(util::LogLevel::Error, "Plugin symbol error: ", e.what());
+            cleanup();
             return false;
+        } catch (const LibraryLoadException& e) {
+            util::gLogger().log(util::LogLevel::Error, "Library load error: ", e.what());
+            cleanup();
+            return false;
+        } catch (const PluginInitializationException& e) {
+            util::gLogger().log(util::LogLevel::Error, "Plugin initialization error: ", e.what());
+            cleanup();
+            return false;
+        } catch (const PluginException& e) {
+            util::gLogger().log(util::LogLevel::Error, "Generic plugin error: ", e.what());
+            cleanup();
+            return false;
+        } catch (...) {
+            util::gLogger().log(util::LogLevel::Error, "Unknown error loading plugin: ", path);
+            cleanup();
+            throw; // Re-throw unknown exceptions
         }
-        return true;
     }
 
     void unload() noexcept {
-        if (plugin_) {
-            plugin_->shutdown();
-            destroy_(plugin_);
-            plugin_ = nullptr;
-        }
-        handle_.close();
-        destroy_ = nullptr;
-        util::gLogger().log(util::LogLevel::Info, "Plugin unloaded");
+        cleanup();
+        util::gLogger().log(util::LogLevel::Info, "Plugin unloaded: ", currentPluginPath_);
+        currentPluginPath_.clear();
     }
 
-    bool isLoaded() const noexcept { return plugin_ != nullptr; }
+    bool isLoaded() const noexcept { 
+        return plugin_ != nullptr; 
+    }
 
     void alert(std::string_view message) noexcept {
         if (plugin_) {
-            try { plugin_->alert(message); }
-            catch (...) { util::gLogger().log(util::LogLevel::Error, "Alert plugin threw exception"); }
+            try { 
+                plugin_->alert(message); 
+            } catch (const PluginException& e) {
+                util::gLogger().log(util::LogLevel::Error, 
+                    "Alert plugin threw plugin exception: ", e.what());
+            } catch (...) { 
+                util::gLogger().log(util::LogLevel::Error, 
+                    "Alert plugin threw unknown exception");
+            }
         }
+    }
+
+    const std::string& getCurrentPluginPath() const noexcept {
+        return currentPluginPath_;
     }
 
     ~PluginManager() {
         unload();
+    }
+
+private:
+    void cleanup() noexcept {
+        if (plugin_) {
+            try {
+                plugin_->shutdown();
+            } catch (...) {
+                // Ignore exceptions during shutdown
+            }
+            
+            if (destroy_) {
+                try {
+                    destroy_(plugin_);
+                } catch (...) {
+                    // Ignore exceptions during destruction
+                }
+            }
+            plugin_ = nullptr;
+        }
+        handle_.close();
+        destroy_ = nullptr;
     }
 };
 
@@ -805,4 +1054,3 @@ int main() {
 
     return 0;
 }
-
