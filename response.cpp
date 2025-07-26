@@ -1113,13 +1113,12 @@ int main() {
 
     std::jthread gpioThread([](std::stop_token stoken) {
         auto& gpioMgr = gpio::GetGPIOManager();
-        // Fix: Use CTAD (Class Template Argument Deduction) for both array and distribution
-        std::array types{gpio::SensorType::Door, gpio::SensorType::Motion, gpio::SensorType::Smoke}; // CTAD: deduces std::array<gpio::SensorType, 3>
+        std::array<gpio::SensorType, 3> types{gpio::SensorType::Door, gpio::SensorType::Motion, gpio::SensorType::Smoke};
         gpio::SensorId sensorId = 1;
         size_t typeIdx = 0;
 
         thread_local std::mt19937 rng{std::random_device{}()};
-        std::uniform_int_distribution dist(0, 4); // Fix: CTAD - template argument deduced automatically as <int>
+        std::uniform_int_distribution<int> dist(0, 4);
 
         while (!stoken.stop_requested()) {
             bool activate = (dist(rng) == 0);
@@ -1152,5 +1151,3 @@ int main() {
 
     return 0;
 }
-
-
